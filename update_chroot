@@ -1,0 +1,270 @@
+#!/bin/bash
+
+# Copyright (c) 2012 The Chromium OS Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+
+. "$(dirname "$0")/common.sh" || exit 1
+
+# Script must run inside the chroot
+assert_inside_chroot "$@"
+
+# Do not run as root
+assert_not_root_user
+
+DEFINE_boolean usepkg "${FLAGS_TRUE}" \
+  "Use binary packages when possible."
+DEFINE_boolean getbinpkg "${FLAGS_TRUE}" \
+  "Download binary packages from remote repository."
+DEFINE_boolean usepkgonly "${FLAGS_FALSE}" \
+  "Only use/download binary packages. Implies --noworkon"
+DEFINE_boolean workon "${FLAGS_TRUE}" \
+  "Automatically rebuild updated cros-workon packages."
+DEFINE_integer jobs "${NUM_JOBS}" \
+  "How many packages to build in parallel at maximum."
+DEFINE_boolean skip_toolchain_update "${FLAGS_FALSE}" \
+  "Don't update the toolchains."
+DEFINE_string toolchain_boards "" \
+  "Extra toolchains to setup for the specified boards."
+
+FLAGS_HELP="usage: $(basename $0) [flags]
+Performs an update of the chroot. This script is called as part of
+build_packages, so there is typically no need to call this script directly.
+"
+
+# Parse command line flags
+FLAGS "$@" || exit 1
+eval set -- "${FLAGS_ARGV}"
+
+# Only now can we die on error.  shflags functions leak non-zero error codes,
+# so will die prematurely if 'switch_to_strict_mode' is specified before now.
+switch_to_strict_mode
+
+if [[ "${FLAGS_usepkgonly}" -eq "${FLAGS_TRUE}" ]]; then
+  for flag in usepkg getbinpkg; do
+    fvar="FLAGS_${flag}"
+    if [[ "${!fvar}" -ne "${FLAGS_TRUE}" ]]; then
+      die_notrace "--usepkgonly is incompatible with --no${flag}"
+    fi
+  done
+  FLAGS_workon="${FLAGS_FALSE}"
+fi
+
+. "${BUILD_LIBRARY_DIR}/toolchain_util.sh"
+
+PORTAGE_STABLE_OVERLAY="${REPO_ROOT}/src/third_party/portage-stable"
+CROSSDEV_OVERLAY="/usr/local/portage/crossdev"
+COREOS_OVERLAY="${REPO_ROOT}/src/third_party/coreos-overlay"
+COREOS_CONFIG="${COREOS_OVERLAY}/coreos/config"
+
+# PORTAGE_USERNAME may already be in the env but set just to be safe.
+: ${PORTAGE_USERNAME:=${USER}}
+
+# Clean up old distfiles cache. It used to be split for 'host' and
+# 'target' but that just duplicates files. Also a ccache was in there.
+if [[ -d "${REPO_CACHE_DIR}/distfiles/host" ]]; then
+  info "Cleaning up old distfiles cache..."
+  sudo mv "${REPO_CACHE_DIR}"/{distfiles/host,distfiles.host}
+  sudo rm -rf "${REPO_CACHE_DIR}/distfiles"
+  sudo mv "${REPO_CACHE_DIR}"/{distfiles.host,distfiles}
+fi
+
+info "Setting up portage..."
+sudo mkdir -p "${REPO_CACHE_DIR}/distfiles"
+sudo chown "${PORTAGE_USERNAME}:portage" "${REPO_CACHE_DIR}/distfiles"
+sudo mkdir -p /etc/portage/repos.conf /var/lib/portage/pkgs
+sudo touch /etc/portage/make.conf.user
+
+sudo_clobber "/etc/portage/make.conf" <<EOF
+# Created by update_chroot
+PORTDIR="${PORTAGE_STABLE_OVERLAY}"
+PORTDIR_OVERLAY="${CROSSDEV_OVERLAY} ${COREOS_OVERLAY}"
+DISTDIR="${REPO_CACHE_DIR}/distfiles"
+PKGDIR="/var/lib/portage/pkgs"
+PORT_LOGDIR="/var/log/portage"
+PORTAGE_BINHOST="$(get_sdk_binhost)"
+PORTAGE_USERNAME="${PORTAGE_USERNAME}"
+MAKEOPTS="--jobs=${NUM_JOBS} --load-average=$((NUM_JOBS * 2))"
+CCACHE_UMASK="002"
+
+# Generally there isn't any need to add packages to @world by default.
+# You can use --select to override this.
+EMERGE_DEFAULT_OPTS="--oneshot"
+
+# Allow the user to override or define additional settings.
+source "/etc/portage/make.conf.user"
+EOF
+
+sudo_clobber "/etc/portage/repos.conf/coreos.conf" <<EOF
+[DEFAULT]
+main-repo = portage-stable
+
+[gentoo]
+disabled = true
+
+[coreos]
+location = ${COREOS_OVERLAY}
+
+[portage-stable]
+location = ${PORTAGE_STABLE_OVERLAY}
+EOF
+
+# Automatically symlink any provided portage repo configurations into
+# the appropriate destination directory from "config/portage/repos".
+# CAUTON: Any repo configuration files with the same name, will be silently
+# relinked to the last file found.
+# Automatic file renaming to avoid this is challenging as it has to deal with
+# the case where we actually do want the files overwritten and so is outside
+# the scope of this function for now.
+# If your taking advantage of this functionality in the build toolchain
+# you probably found out about it from these code comments so we can assume
+# for now at least, that you have been somewhat warned.
+
+# If any directories match config/portage/repos/*/repos.conf
+if [[ -n $(sudo find /mnt/host/source/config/portage/repos \
+  -maxdepth 2 -mindepth 2 -type d -name "repos.conf") ]]; then
+  # If any files match config/portage/repos/*/repos.conf/*
+  if [[ -n $(sudo find /mnt/host/source/config/portage/repos \
+    -maxdepth 3 -mindepth 3 -path "*/repos.conf/*" -type f) ]]; then
+    info "Symlinking portage repo configuration files into repos.conf dir..."
+    # Do not name any of your repo configs "coreos.conf" bad things will happen.
+    # We abort if any file matches config/portage/repos/*/repos.conf/coreos.conf
+    if [[ -n $(sudo find /mnt/host/source/config/portage/repos \
+      -maxdepth 3 -mindepth 3 -path "*/repos.conf/*" -name "coreos.conf") ]]; then
+      die_notrace "One of the portage repo configuration files to be symlinked is " \
+        "named \"coreos.conf\" which will conflict with the main configuation file " \
+        "called \"coreos.conf\" which is created during the chroot build process."
+    fi
+    # We run through all the other files matching config/portage/repos/*/repos.conf/*
+    # and symlink them to the right place for portage.
+    sudo find /mnt/host/source/config/portage/repos \
+      -maxdepth 3 -mindepth 3 -path "*/repos.conf/*" -type f \
+      -exec bash -c 'ln -sf {} /etc/portage/repos.conf/$(basename {})' \;
+  fi
+fi
+
+sudo eselect profile set --force "$(get_sdk_profile)"
+
+# Create crossdev repo_name and metadata
+info "Setting up crossdev..."
+configure_crossdev_overlay "${FLAGS_chroot}" "${CROSSDEV_OVERLAY}"
+
+# Run version hooks as pre-update
+if [[ -f /etc/os-release ]]; then
+  OLDVER=$(grep "^VERSION=" /etc/os-release | cut -d = -f 2-)
+else
+  OLDVER="0.0.0"
+fi
+
+info "Updating chroot:"
+info " chroot version: $OLDVER"
+info " CoreOS version: $COREOS_VERSION"
+
+# Updates should be of the form 1.2.3_desc.sh
+for update_script in ${SCRIPTS_DIR}/sdk_lib/updates/*.sh; do
+  update_name="${update_script##*/}"
+  update_ver="${update_name%%_*}"
+  # Run newer updates but don't pass our current version
+  if ! cmp_ver le "$update_ver" "$COREOS_VERSION"; then
+      warn "Skipping update from the future: $update_name"
+      warn "Perhaps it is time to run a repo sync?"
+  elif ! cmp_ver ge "$OLDVER" "$update_ver"; then
+      info "Running chroot update $update_name"
+      bash -e "$update_script" || die "Update failed: $update_name"
+  fi
+done
+
+"${BUILD_LIBRARY_DIR}/set_lsb_release" --root /
+
+EMERGE_FLAGS=( -uNv --with-bdeps=y --select )
+REBUILD_FLAGS=()
+if [ "${FLAGS_usepkg}" -eq "${FLAGS_TRUE}" ]; then
+  EMERGE_FLAGS+=( --usepkg )
+  if [[ "${FLAGS_usepkgonly}" -eq "${FLAGS_TRUE}" ]]; then
+    EMERGE_FLAGS+=( --usepkgonly --rebuilt-binaries n )
+  fi
+  if [ "${FLAGS_getbinpkg}" -eq "${FLAGS_TRUE}" ]; then
+    EMERGE_FLAGS+=( --getbinpkg )
+  fi
+
+  # Only update toolchain when binpkgs are available.
+  EMERGE_FLAGS+=( $(get_binonly_args $(get_chost_list)) )
+  REBUILD_FLAGS+=( $(get_binonly_args $(get_chost_list)) )
+fi
+
+if [[ "${FLAGS_jobs}" -ne -1 ]]; then
+  EMERGE_FLAGS+=( "--jobs=${FLAGS_jobs}" )
+  REBUILD_FLAGS+=( "--jobs=${FLAGS_jobs}" )
+fi
+
+# Perform an update of coreos-devel/sdk-depends and world in the chroot.
+EMERGE_CMD="emerge"
+
+# In first pass, update portage and toolchains. Lagged updates of both
+# can cause serious issues later.
+info "Updating basic system packages"
+sudo -E ${EMERGE_CMD} --quiet "${EMERGE_FLAGS[@]}" \
+    dev-util/ccache \
+    sys-apps/portage \
+    sys-devel/crossdev \
+    sys-devel/sysroot-wrappers \
+    sys-libs/nss-usrfiles \
+    "${TOOLCHAIN_PKGS[@]}"
+
+gcc_set_latest_profile "$(portageq envvar CHOST)"
+
+if [[ "${FLAGS_skip_toolchain_update}" -eq "${FLAGS_FALSE}" && \
+      -n "${FLAGS_toolchain_boards}" ]]; then
+  CROSS_CHOSTS=( $(get_board_chost ${FLAGS_toolchain_boards} | sort -u) )
+  # double check get_board_chost actually returned results, pipefail isn't set.
+  [[ -n "${CROSS_CHOSTS[*]}" ]] || exit 1
+
+  for cross_chost in "${CROSS_CHOSTS[@]}"; do
+    info "Updating cross ${cross_chost} toolchain"
+    install_cross_toolchain "${cross_chost}" --quiet "${EMERGE_FLAGS[@]}"
+  done
+fi
+
+# Build cros_workon packages when they are changed.
+if [ "${FLAGS_workon}" -eq "${FLAGS_TRUE}" ]; then
+  for pkg in $(cros_workon list --host); do
+    EMERGE_FLAGS+=( "--reinstall-atoms=${pkg}" "--usepkg-exclude=${pkg}" )
+  done
+fi
+
+# XXX: Work around a rename; delete this after SDKs contain the new package.
+sudo -E ${EMERGE_CMD} --rage-clean app-crypt/sbsigntool dev-util/cargo 2>/dev/null || :
+
+# Second pass, update everything else.
+EMERGE_FLAGS+=( --deep )
+info "Updating all SDK packages"
+sudo -E ${EMERGE_CMD} "${EMERGE_FLAGS[@]}" \
+    coreos-devel/sdk-depends world
+
+info "Removing obsolete packages"
+sudo -E ${EMERGE_CMD} --quiet --depclean @unavailable
+
+if portageq list_preserved_libs / >/dev/null; then
+  info "Rebuilding packages linked against old libraries"
+  sudo -E ${EMERGE_CMD} "${REBUILD_FLAGS[@]}" @preserved-rebuild
+fi
+
+# Automatically discard all CONFIG_PROTECT'ed files. Those that are
+# protected should not be overwritten until the variable is changed.
+# Autodiscard is option "-9" followed by the "YES" confirmation.
+printf '%s\nYES\n' -9 | sudo etc-update
+
+# If the user still has old perl modules installed, update them.
+PERL_VERSIONS=$(find /usr/lib*/perl5/vendor_perl/ -maxdepth 1 -mindepth 1 \
+  -type d -printf '%P\n' | sort -u | wc -w)
+if [ "$PERL_VERSIONS" -gt 1 ] ; then
+  sudo perl-cleaner --all -- --quiet
+fi
+
+# Old $PS1 customization that doesn't work any more
+if [[ -e /etc/profile.d/coreos-niceties.sh ]]; then
+  sudo rm -f /etc/profile.d/coreos-niceties.sh
+fi
+
+command_completed

@@ -1,0 +1,32 @@
+#!/bin/bash
+
+# Copyright (c) 2012 The Chromium OS Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+SCRIPT_ROOT=$(readlink -f $(dirname "$0")/..)
+. "${SCRIPT_ROOT}/common.sh" || exit 1
+. "${BUILD_LIBRARY_DIR}/test_image_content.sh" || exit 1
+
+# We're invoked only by build_image, which runs in the chroot
+assert_inside_chroot
+
+# Flags
+DEFINE_string board "${DEFAULT_BOARD}" \
+  "The board name."
+DEFINE_string root "${DEFAULT_BOARD+/build/${DEFAULT_BOARD}}" \
+  "The root file system to check."
+
+# Parse command line
+FLAGS "$@" || exit 1
+eval set -- "${FLAGS_ARGV}"
+
+# Die on any errors
+switch_to_strict_mode
+
+if [[ ! -d "$FLAGS_root" ]]; then
+  die_notrace "Root FS does not exist ($FLAGS_root)"
+fi
+
+BOARD="${FLAGS_board}"
+test_image_content "$FLAGS_root" || die_notrace "Errors found!"

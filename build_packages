@@ -1,0 +1,259 @@
+#!/bin/bash
+
+# Copyright (c) 2011 The Chromium OS Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+. "$(dirname "$0")/common.sh" || exit 1
+
+# Script must run inside the chroot
+assert_inside_chroot
+
+assert_not_root_user
+
+# Developer-visible flags.
+DEFINE_string board "${DEFAULT_BOARD}" \
+  "The board to build packages for."
+DEFINE_boolean usepkg "${FLAGS_TRUE}" \
+  "Use binary packages when possible."
+DEFINE_boolean usepkgonly "${FLAGS_FALSE}" \
+  "Only use/download binary packages. Implies --noworkon"
+DEFINE_boolean getbinpkg "${FLAGS_TRUE}" \
+  "Download binary packages from remote repository."
+DEFINE_string getbinpkgver "" \
+  "Use binary packages from a specific version."
+DEFINE_boolean toolchainpkgonly "${FLAGS_FALSE}" \
+  "Use binary packages only for the board toolchain."
+DEFINE_boolean workon "${FLAGS_TRUE}" \
+  "Automatically rebuild updated cros-workon packages."
+DEFINE_boolean fetchonly "${FLAGS_FALSE}" \
+  "Don't build anything, instead only fetch what is needed."
+DEFINE_integer jobs "${NUM_JOBS}" \
+  "How many packages to build in parallel at maximum."
+DEFINE_boolean rebuild "${FLAGS_FALSE}" \
+  "Automatically rebuild dependencies."
+DEFINE_boolean skip_toolchain_update "${FLAGS_FALSE}" \
+  "Don't update toolchain automatically."
+DEFINE_boolean skip_chroot_upgrade "${FLAGS_FALSE}" \
+  "Don't run the chroot upgrade automatically; use with care."
+DEFINE_boolean skip_torcx_store "${FLAGS_FALSE}" \
+  "Don't build a new torcx store from the updated sysroot."
+
+# include upload options
+. "${BUILD_LIBRARY_DIR}/release_util.sh" || exit 1
+
+FLAGS_HELP="usage: $(basename $0) [flags] [packages]
+
+build_packages updates the set of binary packages needed by CoreOS. It will
+cross compile all packages that have been updated into the given target's root
+and build binary packages as a side-effect. The output packages will be picked
+up by the build_image script to put together a bootable CoreOS image.
+
+If [packages] are specified, only build those specific packages (and any
+dependencies they might need).
+"
+
+# Parse command line
+FLAGS "$@" || exit 1
+eval set -- "${FLAGS_ARGV}"
+
+# Die on any errors.
+switch_to_strict_mode
+
+# TODO(marineam): specify the default top-level ebuild in the portage profile.
+# I could have sworn we did that or similar but maybe got lost at some point.
+if [[ $# -eq 0 ]]; then
+  set -- @system coreos-devel/board-packages
+fi
+
+if [[ -z "${FLAGS_board}" ]]; then
+  echo "Error: --board is required."
+  exit 1
+fi
+
+if [[ "${FLAGS_usepkgonly}" -eq "${FLAGS_TRUE}" ]]; then
+  for flag in usepkg getbinpkg; do
+    fvar="FLAGS_${flag}"
+    if [[ "${!fvar}" -ne "${FLAGS_TRUE}" ]]; then
+      die_notrace "--usepkgonly is incompatible with --no${flag}"
+    fi
+  done
+  if [[ "${FLAGS_rebuild}" -eq "${FLAGS_TRUE}" ]]; then
+    die_notrace "--usepkgonly is incompatible with --rebuild"
+  fi
+  FLAGS_workon="${FLAGS_FALSE}"
+fi
+
+check_gsutil_opts
+
+# Before we can run any tools, we need to update chroot or setup_board.
+UPDATE_ARGS=( --regen_configs )
+if [ "${FLAGS_usepkg}" -eq "${FLAGS_TRUE}" ]; then
+  UPDATE_ARGS+=( --usepkg )
+  if [[ "${FLAGS_usepkgonly}" -eq "${FLAGS_TRUE}" ]]; then
+    UPDATE_ARGS+=( --usepkgonly )
+  else
+    UPDATE_ARGS+=( --nousepkgonly )
+  fi
+  if [[ "${FLAGS_getbinpkg}" -eq "${FLAGS_TRUE}" ]]; then
+    UPDATE_ARGS+=( --getbinpkg )
+  else
+    UPDATE_ARGS+=( --nogetbinpkg )
+  fi
+  if [[ "${FLAGS_toolchainpkgonly}" -eq "${FLAGS_TRUE}" ]]; then
+    UPDATE_ARGS+=( --toolchainpkgonly )
+  else
+    UPDATE_ARGS+=( --notoolchainpkgonly )
+  fi
+  if [[ -n "${FLAGS_getbinpkgver}" ]]; then
+    UPDATE_ARGS+=( --getbinpkgver="${FLAGS_getbinpkgver}" )
+  fi
+else
+  UPDATE_ARGS+=( --nousepkg )
+fi
+if [[ "${FLAGS_jobs}" -ne -1 ]]; then
+  UPDATE_ARGS+=( --jobs=${FLAGS_jobs} )
+fi
+if [ "${FLAGS_skip_toolchain_update}" -eq "${FLAGS_TRUE}" ]; then
+  UPDATE_ARGS+=( --skip_toolchain_update )
+fi
+if [ "${FLAGS_skip_chroot_upgrade}" -eq "${FLAGS_TRUE}" ]; then
+  UPDATE_ARGS+=( --skip_chroot_upgrade )
+fi
+
+"${SCRIPTS_DIR}"/setup_board --quiet --board=${FLAGS_board} "${UPDATE_ARGS[@]}"
+
+# set BOARD and BOARD_ROOT
+. "${BUILD_LIBRARY_DIR}/toolchain_util.sh" || exit 1
+. "${BUILD_LIBRARY_DIR}/board_options.sh" || exit 1
+. "${BUILD_LIBRARY_DIR}/test_image_content.sh" || exit 1
+
+# Setup all the emerge command/flags.
+EMERGE_FLAGS=( -uDNv --backtrack=30 --select )
+REBUILD_FLAGS=()
+EMERGE_CMD=( "emerge-${FLAGS_board}" )
+if [[ "${FLAGS_fetchonly}" -eq "${FLAGS_TRUE}" ]]; then
+  EMERGE_CMD+=( --fetchonly )
+fi
+
+EMERGE_CMD+=( ${EXTRA_BOARD_FLAGS} )
+
+if [[ "${FLAGS_usepkg}" -eq "${FLAGS_TRUE}" ]]; then
+  # Use binary packages. Include all build-time dependencies,
+  # so as to avoid unnecessary differences between source
+  # and binary builds except for --usepkgonly for speed.
+  if [[ "${FLAGS_usepkgonly}" -eq "${FLAGS_TRUE}" ]]; then
+    EMERGE_FLAGS+=( --usepkgonly --rebuilt-binaries n )
+  else
+    EMERGE_FLAGS+=( --usepkg --with-bdeps y )
+
+    # Only update toolchain when binpkgs are available.
+    EMERGE_FLAGS+=( $(get_binonly_args) )
+    REBUILD_FLAGS+=( $(get_binonly_args) )
+  fi
+  if [[ "${FLAGS_getbinpkg}" -eq "${FLAGS_TRUE}" ]]; then
+      EMERGE_FLAGS+=( --getbinpkg )
+  fi
+fi
+
+if [[ "${FLAGS_jobs}" -ne -1 ]]; then
+  EMERGE_FLAGS+=( --jobs=${FLAGS_jobs} )
+  REBUILD_FLAGS+=( --jobs=${FLAGS_jobs} )
+fi
+
+if [[ "${FLAGS_rebuild}" -eq "${FLAGS_TRUE}" ]]; then
+  EMERGE_FLAGS+=( --rebuild-if-unbuilt )
+fi
+
+# Build cros_workon packages when they are changed.
+CROS_WORKON_PKGS=()
+if [ "${FLAGS_workon}" -eq "${FLAGS_TRUE}" ]; then
+  CROS_WORKON_PKGS+=( $(cros_workon list --board=${FLAGS_board}) )
+fi
+
+if [[ ${#CROS_WORKON_PKGS[@]} -gt 0 ]]; then
+  EMERGE_FLAGS+=(
+    --reinstall-atoms="${CROS_WORKON_PKGS[*]}"
+    --usepkg-exclude="${CROS_WORKON_PKGS[*]}"
+  )
+fi
+
+# Goo to attempt to resolve dependency loops on individual packages.
+# If this becomes insufficient we will need to move to a full multi-stage
+# bootstrap process like we do with the SDK via catalyst.
+break_dep_loop() {
+  local pkg="$1"
+  local flags=( ${2//,/ } )
+  shift 2
+  local flag_file="${BOARD_ROOT}/etc/portage/package.use/break_dep_loop"
+
+  # Be sure to clean up use flag hackery from previous failed runs
+  sudo rm -f "${flag_file}"
+
+  # If the package is already installed we have nothing to do
+  if portageq-"${BOARD}" has_version "${BOARD_ROOT}" "${pkg}"; then
+    return 0
+  fi
+
+  # Likewise, nothing to do if the flag isn't actually enabled.
+  if ! pkg_use_enabled "${pkg}" "${flags[@]}"; then
+    return 0
+  fi
+
+  # Temporarily compile/install package with flag disabled. If a binary
+  # package is available use it regardless of its version or use flags.
+  local disabled_flags="${flags[@]/#/-}"
+  info "Merging ${pkg} wtih USE=${disabled_flags}"
+  sudo mkdir -p "${flag_file%/*}"
+  sudo_clobber "${flag_file}" <<<"${pkg} ${disabled_flags}"
+  # Disable any other problematic flags
+  extra_args=""
+  while [[ $# -gt 0 ]]; do
+      sudo_append "${flag_file}" <<<"$1 -$2"
+      extra_args+=" --buildpkg-exclude=$1 --useoldpkg-atoms=$1"
+      shift 2
+  done
+  # rebuild-if-unbuilt is disabled to prevent portage from needlessly
+  # rebuilding zlib for some unknown reason, in turn triggering more rebuilds.
+  sudo -E "${EMERGE_CMD[@]}" "${EMERGE_FLAGS[@]}" \
+      --rebuild-if-unbuilt=n \
+      --buildpkg-exclude="${pkg}" \
+      ${extra_args} "${pkg}"
+  sudo rm -f "${flag_file}"
+}
+
+if [[ "${FLAGS_usepkgonly}" -eq "${FLAGS_FALSE}" ]]; then
+  # util-linux[udev] -> virtual->udev -> systemd -> util-linux
+  break_dep_loop sys-apps/util-linux udev,systemd sys-apps/systemd cryptsetup
+
+  # systemd[cryptsetup] -> cryptsetup -> lvm2 -> virtual/udev -> systemd
+  break_dep_loop sys-apps/systemd cryptsetup
+fi
+
+info "Merging board packages now"
+sudo -E "${EMERGE_CMD[@]}" "${EMERGE_FLAGS[@]}" "$@"
+
+info "Removing obsolete packages"
+sudo -E "${EMERGE_CMD[@]}" --quiet --depclean @unavailable
+
+if [[ "${FLAGS_usepkgonly}" -eq "${FLAGS_FALSE}" ]]; then
+  if "portageq-${BOARD}" list_preserved_libs "${BOARD_ROOT}" >/dev/null; then
+    sudo -E "${EMERGE_CMD[@]}" "${REBUILD_FLAGS[@]}" @preserved-rebuild
+  fi
+fi
+
+eclean-$BOARD -d packages
+
+info "Checking build root"
+test_image_content "${BOARD_ROOT}"
+
+# upload packages if enabled
+upload_packages
+
+# Build a new torcx store with the updated packages, passing flags through.
+if [ "${FLAGS_skip_torcx_store}" -eq "${FLAGS_FALSE}" ]; then
+  "${SCRIPTS_DIR}"/build_torcx_store --board="${BOARD}"
+fi
+
+info "Builds complete"
+command_completed

@@ -1,0 +1,76 @@
+#!/bin/bash
+
+# Copyright (c) 2011 The Chromium OS Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+# Script to set /etc/lsb-release on the root file system. This script is run by
+# build_image inside chroot.
+
+SCRIPT_ROOT=$(readlink -f $(dirname "$0")/..)
+. "${SCRIPT_ROOT}/common.sh" || exit 1
+
+# Flags
+DEFINE_string board "" "The board to build an image for."
+DEFINE_string root "" "The root file system to write /etc/lsb-release to."
+DEFINE_string group "" "The default update group for update_engine."
+
+# Parse command line
+FLAGS "$@" || exit 1
+eval set -- "${FLAGS_ARGV}"
+
+switch_to_strict_mode
+
+ROOT_FS_DIR="$FLAGS_root"
+[ -n "$ROOT_FS_DIR" ] || die "--root is required."
+[ -d "$ROOT_FS_DIR" ] || die "Root FS does not exist? ($ROOT_FS_DIR)"
+
+OS_NAME="Container Linux by CoreOS"
+OS_CODENAME="Rhyolite"
+OS_ID="coreos"
+OS_PRETTY_NAME="$OS_NAME $COREOS_VERSION (${OS_CODENAME})"
+
+COREOS_APPID="{e96281a6-d1af-4bde-9a0a-97b76e56dc57}"
+
+# DISTRIB_* are the standard lsb-release names
+sudo mkdir -p "${ROOT_FS_DIR}/usr/share/coreos" "${ROOT_FS_DIR}/etc/coreos"
+sudo_clobber "${ROOT_FS_DIR}/usr/share/coreos/lsb-release" <<EOF
+DISTRIB_ID="$OS_NAME"
+DISTRIB_RELEASE=$COREOS_VERSION
+DISTRIB_CODENAME="$OS_CODENAME"
+DISTRIB_DESCRIPTION="$OS_PRETTY_NAME"
+EOF
+sudo ln -sf "../usr/share/coreos/lsb-release" "${ROOT_FS_DIR}/etc/lsb-release"
+
+# And the new standard, os-release
+# https://www.freedesktop.org/software/systemd/man/os-release.html
+sudo_clobber "${ROOT_FS_DIR}/usr/lib/os-release" <<EOF
+NAME="$OS_NAME"
+ID=$OS_ID
+VERSION=$COREOS_VERSION
+VERSION_ID=$COREOS_VERSION_ID
+BUILD_ID=$COREOS_BUILD_ID
+PRETTY_NAME="$OS_PRETTY_NAME"
+ANSI_COLOR="38;5;75"
+HOME_URL="https://coreos.com/"
+BUG_REPORT_URL="https://issues.coreos.com"
+COREOS_BOARD="$FLAGS_board"
+EOF
+sudo ln -sf "../usr/lib/os-release" "${ROOT_FS_DIR}/etc/os-release"
+sudo ln -sf "../../lib/os-release" "${ROOT_FS_DIR}/usr/share/coreos/os-release"
+
+# Create the defaults for the coreos configuration files in the usr directory
+sudo_clobber "${ROOT_FS_DIR}/usr/share/coreos/release" <<EOF
+COREOS_RELEASE_VERSION=$COREOS_VERSION
+COREOS_RELEASE_BOARD=$FLAGS_board
+COREOS_RELEASE_APPID=$COREOS_APPID
+EOF
+
+sudo_clobber "${ROOT_FS_DIR}/usr/share/coreos/update.conf" <<EOF
+SERVER=https://public.update.core-os.net/v1/update/
+GROUP=$FLAGS_group
+EOF
+
+sudo_clobber "${ROOT_FS_DIR}/etc/coreos/update.conf" <<EOF
+GROUP=$FLAGS_group
+EOF
